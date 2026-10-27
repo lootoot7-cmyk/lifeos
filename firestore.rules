@@ -1,0 +1,258 @@
+rules_version = '2';
+
+// Ownership model: every personal record carries `ownerId` == the creator's
+// auth uid. Nobody else (including admins) can read or write it. Server-only
+// collections (users, notifications, auditLogs) are written by Cloud Functions
+// through the Admin SDK, which bypasses these rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Allows reading a missing doc so clients can detect "not found" for their own ids.
+    function canReadOwned() {
+      return signedIn() && (resource == null || resource.data.ownerId == request.auth.uid);
+    }
+
+    function owns() {
+      return signedIn() && resource.data.ownerId == request.auth.uid;
+    }
+
+    function createsOwn() {
+      return signedIn() && request.resource.data.ownerId == request.auth.uid;
+    }
+
+    function ownerUnchanged() {
+      return request.resource.data.ownerId == resource.data.ownerId;
+    }
+
+    function data() {
+      return request.resource.data;
+    }
+
+    function onlyKeys(required, optional) {
+      return data().keys().hasAll(required) && data().keys().hasOnly(required.concat(optional));
+    }
+
+    function str(v, min, max) {
+      return v is string && v.size() >= min && v.size() <= max;
+    }
+
+    function strOrNull(v, max) {
+      return v == null || str(v, 0, max);
+    }
+
+    function isoDate(v) {
+      return v is string && v.matches('^[0-9]{4}-[0-1][0-9]-[0-3][0-9]$');
+    }
+
+    function isoDateOrNull(v) {
+      return v == null || isoDate(v);
+    }
+
+    function numOrNull(v) {
+      return v == null || v is number;
+    }
+
+    function stampedNow(field) {
+      return data()[field] == request.time;
+    }
+
+    function createdAtKept() {
+      return data().createdAt == resource.data.createdAt;
+    }
+
+    // ---------------------------------------------------------------- accounts
+
+    match /users/{uid} {
+      allow read: if isSelf(uid);
+      allow write: if false;
+
+      match /fcmTokens/{token} {
+        allow read, delete: if isSelf(uid);
+        allow create, update: if isSelf(uid)
+          && onlyKeys(['token', 'platform', 'updatedAt'], [])
+          && data().token == token
+          && str(data().platform, 1, 20)
+          && stampedNow('updatedAt');
+      }
+    }
+
+    function validProfile() {
+      let p = data().notificationPrefs;
+      return onlyKeys([
+          'displayName', 'photoURL', 'email', 'phone', 'country', 'timeZone',
+          'language', 'theme', 'notificationPrefs', 'modules',
+          'onboardingCompleted', 'aiAnalysisEnabled', 'createdAt', 'updatedAt'
+        ], [])
+        && str(data().displayName, 0, 100)
+        && strOrNull(data().photoURL, 2048)
+        && strOrNull(data().email, 320)
+        && strOrNull(data().phone, 32)
+        && str(data().country, 0, 64)
+        && str(data().timeZone, 1, 64)
+        && data().language in ['en', 'ur']
+        && data().theme in ['system', 'light', 'dark']
+        && data().modules is list && data().modules.size() <= 12
+        && data().onboardingCompleted is bool
+        && data().aiAnalysisEnabled is bool
+        && p is map
+        && p.keys().hasOnly(['push', 'email', 'inApp', 'quietStart', 'quietEnd', 'reminderHour'])
+        && p.push is bool && p.email is bool && p.inApp is bool
+        && (p.quietStart == null || (p.quietStart is int && p.quietStart >= 0 && p.quietStart <= 23))
+        && (p.quietEnd == null || (p.quietEnd is int && p.quietEnd >= 0 && p.quietEnd <= 23))
+        && p.reminderHour is int && p.reminderHour >= 0 && p.reminderHour <= 23
+        && stampedNow('updatedAt');
+    }
+
+    match /profiles/{uid} {
+      allow read: if isSelf(uid);
+      allow create: if isSelf(uid) && validProfile() && stampedNow('createdAt');
+      allow update: if isSelf(uid) && validProfile() && createdAtKept();
+      allow delete: if false;
+    }
+
+    // --------------------------------------------------------------- LifeVault
+
+    function validVaultDocument() {
+      return onlyKeys([
+          'ownerId', 'name', 'category', 'issueDate', 'expiryDate', 'renewalDate',
+          'notes', 'tags', 'attachments', 'reminderOffsets', 'important', 'source',
+          'receiptId', 'createdAt', 'updatedAt'
+        ], [])
+        && str(data().name, 1, 200)
+        && data().category in [
+          'bills', 'warranties', 'contracts', 'certificates', 'ids', 'passports',
+          'vehicle', 'insurance', 'property', 'school', 'work', 'records',
+          'subscriptions', 'renewals'
+        ]
+        && isoDateOrNull(data().issueDate)
+        && isoDateOrNull(data().expiryDate)
+        && isoDateOrNull(data().renewalDate)
+        && str(data().notes, 0, 5000)
+        && data().tags is list && data().tags.size() <= 20
+        && data().attachments is list && data().attachments.size() <= 10
+        && data().reminderOffsets is list && data().reminderOffsets.size() <= 10
+        && data().important is bool
+        && data().source in ['manual', 'receipt', 'capture']
+        && strOrNull(data().receiptId, 128)
+        && stampedNow('updatedAt');
+    }
+
+    match /documents/{id} {
+      allow read: if canReadOwned();
+      allow create: if createsOwn() && validVaultDocument() && stampedNow('createdAt');
+      allow update: if owns() && ownerUnchanged() && validVaultDocument() && createdAtKept();
+      allow delete: if owns();
+    }
+
+    // --------------------------------------------------------------- Reminders
+
+    function validReminder() {
+      return onlyKeys([
+          'ownerId', 'title', 'kind', 'sourceType', 'sourceId', 'dueDate',
+          'offsetDays', 'remindAt', 'status', 'createdAt'
+        ], [])
+        && str(data().title, 1, 300)
+        && data().kind in ['expiry', 'renewal', 'warranty', 'return', 'bill', 'custom']
+        && data().sourceType in ['document', 'receipt', 'manual']
+        && strOrNull(data().sourceId, 128)
+        && isoDate(data().dueDate)
+        && data().offsetDays is int && data().offsetDays >= 0 && data().offsetDays <= 3650
+        && data().remindAt is timestamp
+        && data().status == 'scheduled';
+    }
+
+    match /reminders/{id} {
+      allow read: if canReadOwned();
+      allow create: if createsOwn() && validReminder() && stampedNow('createdAt');
+      allow update: if owns()
+        && data().diff(resource.data).affectedKeys().hasOnly(['status'])
+        && data().status in ['scheduled', 'done', 'dismissed'];
+      allow delete: if owns();
+    }
+
+    // ------------------------------------------------------------ ReceiptBrain
+
+    function validReceipt() {
+      return onlyKeys([
+          'ownerId', 'store', 'purchaseDate', 'currency', 'subtotal', 'tax', 'total',
+          'paymentMethod', 'items', 'returnDeadline', 'file', 'extraction', 'notes',
+          'createdAt'
+        ], [])
+        && str(data().store, 1, 200)
+        && isoDate(data().purchaseDate)
+        && str(data().currency, 3, 3)
+        && numOrNull(data().subtotal)
+        && numOrNull(data().tax)
+        && data().total is number && data().total >= 0
+        && strOrNull(data().paymentMethod, 100)
+        && data().items is list && data().items.size() <= 200
+        && isoDateOrNull(data().returnDeadline)
+        && (data().file == null || data().file is map)
+        && (data().extraction == null || data().extraction is map)
+        && str(data().notes, 0, 5000);
+    }
+
+    match /receipts/{id} {
+      allow read: if canReadOwned();
+      allow create: if createsOwn() && validReceipt() && stampedNow('createdAt');
+      allow update: if owns() && ownerUnchanged() && validReceipt() && createdAtKept();
+      allow delete: if owns();
+    }
+
+    function validPurchase() {
+      return onlyKeys([
+          'ownerId', 'receiptId', 'name', 'category', 'quantity', 'unitPrice',
+          'totalPrice', 'currency', 'store', 'purchaseDate', 'warrantyDocumentId',
+          'createdAt'
+        ], [])
+        && str(data().receiptId, 1, 128)
+        && str(data().name, 1, 200)
+        && data().category in [
+          'electronics', 'appliances', 'groceries', 'clothing', 'home', 'health',
+          'beauty', 'vehicle', 'dining', 'services', 'other'
+        ]
+        && data().quantity is number && data().quantity > 0
+        && numOrNull(data().unitPrice)
+        && data().totalPrice is number && data().totalPrice >= 0
+        && str(data().currency, 3, 3)
+        && str(data().store, 1, 200)
+        && isoDate(data().purchaseDate)
+        && strOrNull(data().warrantyDocumentId, 128);
+    }
+
+    match /purchases/{id} {
+      allow read: if canReadOwned();
+      allow create: if createsOwn() && validPurchase() && stampedNow('createdAt');
+      allow update: if owns() && ownerUnchanged() && validPurchase() && createdAtKept();
+      allow delete: if owns();
+    }
+
+    // ----------------------------------------------------- Server-written data
+
+    match /notifications/{id} {
+      allow read: if canReadOwned();
+      allow update: if owns()
+        && data().diff(resource.data).affectedKeys().hasOnly(['read'])
+        && data().read is bool;
+      allow delete: if owns();
+      allow create: if false;
+    }
+
+    match /auditLogs/{id} {
+      allow read: if canReadOwned();
+      allow write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

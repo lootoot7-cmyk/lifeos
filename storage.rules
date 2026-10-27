@@ -1,0 +1,31 @@
+rules_version = '2';
+
+// Every user's files live under users/{uid}/ and are private to that user.
+// Exports are written only by Cloud Functions (Admin SDK bypasses rules).
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSelf(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+
+    function allowedUpload() {
+      return request.resource.size < 15 * 1024 * 1024
+        && (request.resource.contentType.matches('image/.*')
+            || request.resource.contentType == 'application/pdf');
+    }
+
+    match /users/{uid}/exports/{file} {
+      allow read, delete: if isSelf(uid);
+      allow write: if false;
+    }
+
+    match /users/{uid}/{area}/{allPaths=**} {
+      allow read, delete: if isSelf(uid) && area != 'exports';
+      allow create, update: if isSelf(uid) && area in ['vault', 'receipts', 'captures', 'avatar'] && allowedUpload();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
